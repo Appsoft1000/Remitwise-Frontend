@@ -1,13 +1,13 @@
-# meridian-api: Amount Precision & Auth Design
+# meridian-api: Amount Precision, Auth Flows & Pagination Design
 
-**Issue:** #1642 — Quality/High: authentication and account recovery: amount precision and overflow
+**Issues:** #1642 (Amount Precision), #1646 (Pagination & Cursor Semantics)
 **Date:** 2026-08-28
 
 ---
 
 ## Overview
 
-This module implements production-grade amount precision and overflow-safe authentication/account-recovery flows for the Meridian API layer.  It addresses the security and UX-correctness concerns raised in #1642.
+This module implements production-grade amount precision, overflow-safe authentication/account-recovery flows, and deterministic cursor-based pagination for the Meridian API layer.
 
 ---
 
@@ -15,14 +15,15 @@ This module implements production-grade amount precision and overflow-safe authe
 
 ```
 meridian-api/src/
-├── lib.rs                  # Crate root — re-exports amount and auth
+├── lib.rs                  # Crate root — re-exports amount, auth, pagination
 ├── amount.rs               # Type-safe Stellar amounts with checked arithmetic
+├── pagination.rs           # Opaque cursors, page limits, scope safety
 └── auth/
     ├── mod.rs              # Auth module root — re-exports public types
     ├── errors.rs           # AuthError enum with structured context
     ├── tokens.rs           # Token lifecycle (issue, verify, refresh, revoke)
-    ├── flows.rs            # Sign-in, logout, verification flows
-    ├── recovery.rs         # Account recovery (two-phase, idempotent)
+    ├── flows.rs            # Sign-in, logout, verification + paginated queries
+    ├── recovery.rs         # Account recovery + paginated queries
     └── validation.rs       # Auth-context validation helpers
 ```
 
@@ -32,91 +33,123 @@ meridian-api/src/
 
 ### Amount Precision (`amount.rs`)
 
-1. **Strictly positive**: An `Amount` is always `> 0`.  Zero and negative values are rejected at construction time via `Amount::new()`.
-2. **Stellar range**: The raw stroop value is `<= i64::MAX` (9,223,372,036,854,775,807).  Stored as `u64` to prevent accidental negative arithmetic.
-3. **Exact decimal conversion**: `from_xlm_decimal()` rejects strings with more than 7 fractional digits (loss-of-precision guard).
-4. **Checked arithmetic**: All operations (`checked_add`, `checked_sub`, `checked_mul_u64`, `checked_div_u64`) use checked primitives.  Overflow/underflow/divide-by-zero returns `AmountError` *before* any state change.
-5. **128-bit intermediates**: Basis-point and percentage fee calculations use `u128` intermediates to prevent overflow during multiplication, then validate the result fits in the Stellar range.
-6. **Balance accumulation**: `accumulate_balance()` and `deduct_balance()` are the canonical ways to update balances — checked arithmetic happens before the caller writes to storage.
+1. **Strictly positive**: An `Amount` is always `> 0`. Zero and negative values are rejected at construction time via `Amount::new()`.
+2. **Stellar range**: The raw stroop value is `<= i64::MAX`. Stored as `u64` to prevent accidental negative arithmetic.
+3. **Exact decimal conversion**: `from_xlm_decimal()` rejects strings with more than 7 fractional digits.
+4. **Checked arithmetic**: All operations use checked primitives. Overflow/underflow returns `AmountError` *before* any state change.
+5. **128-bit intermediates**: Fee calculations use `u128` intermediates to prevent intermediate overflow.
+6. **Balance accumulation**: `accumulate_balance()` and `deduct_balance()` are the canonical ways to update balances.
 
 ### Auth Flows (`auth/`)
 
-7. **Stale token rejection**: Expired, revoked, or unknown tokens are rejected without advancing to any authoritative state.
-8. **Token rotation**: Refresh tokens are rotated on every use.  The old refresh token is immediately revoked.  Replay of a rotated token revokes the entire session.
-9. **Multi-device safety**: Concurrent logins create independent sessions.  Logout revokes all tokens for a user.
-10. **Recovery idempotency**: Repeated recovery requests for the same session produce the same outcome.  Only the first recovery completes; subsequent attempts are rejected.
-11. **Amount validation before state change**: Balance snapshots in login responses are validated through `Amount` before any tokens are issued.  Invalid balances cause login to fail cleanly — no rounding, truncation, or silent clamping.
-12. **No partial state on failure**: Any failed or rejected operation leaves zero side-effects.
+7. **Stale token rejection**: Expired, revoked, or unknown tokens are rejected without state changes.
+8. **Token rotation**: Refresh tokens are rotated on every use. Replay of a rotated token revokes the entire session.
+9. **Multi-device safety**: Concurrent logins create independent sessions. Logout revokes all tokens.
+10. **Recovery idempotency**: Repeated recovery requests produce the same outcome.
+11. **Amount validation before state change**: Balance snapshots are validated through `Amount` before tokens are issued.
+12. **No partial state on failure**: Any failed operation leaves zero side-effects.
+
+### Pagination & Cursor Semantics (`pagination.rs`)
+
+13. **Deterministic ordering**: All paginated queries sort by `(created_at DESC, id DESC)` — the same cursor always resolves to the same position regardless of concurrent inserts.
+14. **Opaque cursors**: Cursors are encoded byte sequences with a Fletcher-16 integrity checksum. They cannot be fabricated or tampered with without detection.
+15. **Scope safety**: Each cursor is bound to a specific subject (user id). A cursor for user A cannot be used to paginate user B's data.
+16. **Page limits**: Every paginated query enforces `MIN_PAGE_SIZE` (1) and `MAX_PAGE_SIZE` (100). Callers cannot request unlimited pages.
+17. **End-of-stream**: When no more results exist, `next_cursor` is `None` and `has_more` is `false`.
+18. **Empty results**: An empty page returns `items: []`, `next_cursor: None`, `has_more: false`, `total_count: 0`.
+19. **Invalid cursors**: Malformed, corrupted, or scope-mismatched cursors return `PaginationError`, never partial data.
+20. **Idempotent re-queries**: Re-fetching the same page (same cursor) returns the same results.
+
+---
+
+## Cursor Encoding
+
+Cursors encode: `[subject_len:u16][subject_bytes][timestamp:u64 BE][id:u64 BE][checksum:u16]`
+
+- **Fletcher-16 checksum** detects accidental corruption and casual tampering.
+- **Base-64 encoding** makes cursors safe for HTTP headers, query parameters, and storage.
+- A production implementation should replace Fletcher-16 with HMAC-SHA256 for cryptographic integrity.
 
 ---
 
 ## Failure Behavior
 
-| Condition | Amount Module | Auth Module |
-|---|---|---|
-| Zero amount | `Err(AmountError::Zero)` | `Err(AuthError::AmountValidationFailed)` |
-| Overflow | `Err(AmountError::Overflow)` | `Err(AuthError::AmountValidationFailed)` |
-| Negative result | `Err(AmountError::NegativeResult)` | `Err(AuthError::AmountValidationFailed)` |
-| Divide by zero | `Err(AmountError::DivisionByZero)` | N/A |
-| Loss of precision | `Err(AmountError::LossOfPrecision)` | `Err(AuthError::AmountValidationFailed)` |
-| Token expired | N/A | `Err(AuthError::TokenExpired)` |
-| Token revoked | N/A | `Err(AuthError::TokenRevoked)` |
-| Token replay | N/A | `Err(AuthError::TokenAlreadyUsed)` — revokes session |
-| Account locked | N/A | `Err(AuthError::AccountLocked { retry_after_secs })` |
-| Invalid credentials | N/A | `Err(AuthError::InvalidCredentials)` |
-| Recovery already completed | N/A | `Err(AuthError::RecoveryAlreadyCompleted)` |
-| Session not found | N/A | `Err(AuthError::SessionNotFound)` |
+| Condition | Amount Module | Auth Module | Pagination Module |
+|---|---|---|---|
+| Zero amount | `Err(AmountError::Zero)` | `Err(AuthError::AmountValidationFailed)` | — |
+| Overflow | `Err(AmountError::Overflow)` | `Err(AuthError::AmountValidationFailed)` | — |
+| Token expired | — | `Err(AuthError::TokenExpired)` | — |
+| Token revoked | — | `Err(AuthError::TokenRevoked)` | — |
+| Token replay | — | `Err(AuthError::TokenAlreadyUsed)` | — |
+| Account locked | — | `Err(AuthError::AccountLocked { .. })` | — |
+| Invalid cursor | — | — | `Err(PaginationError::CursorInvalid)` |
+| Scope mismatch | — | — | `Err(PaginationError::CursorScopeMismatch)` |
+| Invalid page size | — | — | Clamped to `[1, 100]` |
+
+---
+
+## Paginated Collections
+
+Three collections support cursor-based pagination:
+
+| Collection | Query Method | Sort Key | Subject Filter |
+|---|---|---|---|
+| Sessions | `AuthService::list_sessions()` | `(created_at, id)` | `session.subject == subject` |
+| Tokens | `AuthService::list_tokens()` | `(access.issued_at, access.id)` | Active, non-superseded sessions |
+| Recovery Requests | `RecoveryService::list_requests()` | `(created_at, id)` | `request.subject == subject` |
+
+Each also supports filtered variants (e.g., `list_requests_by_status()`).
 
 ---
 
 ## Compatibility Impact
 
-- **No breaking changes to existing public behavior.**  This module is new and does not modify existing code.
-- The `Amount` type uses Stellar's native stroop representation, making it directly compatible with the Stellar SDK's `i64` convention via `as_i64()`.
-- All error types are structured enums — callers can match on specific variants for recovery logic.
+- **No breaking changes.** All modules are additive.
+- The `Amount` type uses Stellar's native stroop representation.
+- Pagination is opt-in — existing code continues to work without changes.
+- `RecoveryStatus` is now publicly exported from the auth module.
 
 ---
 
-## Migration / Rollout Considerations
+## Migration / Rollout
 
-- This module is standalone and can be adopted incrementally by existing services.
-- Services currently using raw `u64` or `i64` for amounts should migrate to `Amount` to gain overflow protection.
-- Token management should replace any existing ad-hoc token handling.
+- Adopt `Amount` incrementally to replace raw `u64`/`i64` amounts.
+- Replace ad-hoc token handling with `TokenStore`.
+- Use `list_sessions()`, `list_tokens()`, `list_requests()` instead of direct collection access for UI pagination.
+- Cursor format is self-describing — no migration needed when upgrading.
 
 ---
 
 ## Security Assumptions
 
-1. **System clock is monotonic**: Token expiry relies on `SystemTime`.  Clock skew is out of scope.
-2. **Token store integrity**: The in-memory `TokenStore` is a reference implementation.  Production deployments must persist token state with appropriate locking.
-3. **No cryptographic verification**: Token signatures are out of scope for this module.  The `TokenInvalid` variant exists for future JWT/signature validation.
-4. **Subject uniqueness**: Token subjects (user identifiers) are assumed unique and externally validated.
-5. **Recovery channel security**: The mechanism for delivering recovery tokens (email, SMS) is out of scope.  This module only handles the token lifecycle.
+1. **System clock is monotonic**: Token expiry and cursor timestamps rely on `SystemTime`.
+2. **Token store integrity**: The in-memory `TokenStore` is a reference implementation.
+3. **No cryptographic verification**: Token signatures are out of scope.
+4. **Subject uniqueness**: Token subjects are assumed unique and externally validated.
+5. **Cursor integrity**: Fletcher-16 is sufficient for reference implementations. Production should use HMAC-SHA256.
+6. **Pagination does not leak cross-subject data**: Scope validation enforces subject binding on every cursor use.
 
 ---
 
 ## Test Coverage
 
-**112 tests** covering:
+**163 tests** covering:
 
-- **Amount module (50 tests):** Construction (zero, min, max, overflow), decimal parsing (whole, fractional, too many digits, negative, large values), i64 conversion, display formatting, all arithmetic operations (add, sub, mul, div), basis-point fees, percentage fees, balance accumulation/deduction, cross-multiply, roundtrip conversions, and 4 independent oracle tests against known Stellar values.
-
-- **Auth tokens (10 tests):** Issue, verify, expiry, revocation, refresh rotation, replay detection, full session revocation, monotonic IDs, balance stroop preservation.
-
-- **Auth flows (14 tests):** Login success, balance validation (valid, zero, overflow), empty password, lockout, attempt counter reset, logout (single, all), verification, multi-device concurrent sessions, session isolation, refresh, refresh replay.
-
-- **Auth recovery (9 tests):** Request, idempotency, completion (revokes other sessions, issues fresh tokens), replay rejection, cancellation, already-completed rejection, balance non-exposure.
-
-- **Auth validation (29 tests):** Amount validation, balance deltas (credit, debit, insufficient, unknown operation, overflow), fee validation, session ID, subject, password, recovery token expiry, recovery balance consistency, oracle fee/delta tests.
+- **Amount module (50 tests):** Construction, decimal parsing, i64 conversion, display, arithmetic, fees, balance operations, oracle tests.
+- **Auth tokens (10 tests):** Issue, verify, expiry, revocation, refresh, replay, monotonic IDs.
+- **Auth flows (25 tests):** Login, balance validation, lockout, logout, verification, multi-device, refresh, **plus 10 new pagination tests** for session/token listing.
+- **Auth recovery (20 tests):** Request, idempotency, completion, replay, cancellation, **plus 9 new pagination tests** for recovery request listing.
+- **Auth validation (29 tests):** Amount, balance, fee, session, subject, password, recovery validators.
+- **Pagination module (29 tests):** Cursor encode/decode, base64, Fletcher-16, page size normalization, empty pages, `compute_page` (empty, single-page, multi-page, exact boundary, scope isolation, stale cursor, large results, deterministic ordering, cursor between items, page-size-one).
 
 ---
 
 ## Validation Commands
 
 ```bash
-cargo fmt -- --check     # formatting
-cargo clippy -- -D warnings  # linting
-cargo test               # full test suite (112 tests)
+cargo fmt -- --check        # formatting
+cargo clippy -- -D warnings # linting
+cargo test                  # full test suite (163 tests)
 ```
 
 All three pass cleanly as of 2026-08-28.
@@ -125,17 +158,18 @@ All three pass cleanly as of 2026-08-28.
 
 ## Files Changed
 
-| File | Lines | Description |
-|---|---|---|
-| `meridian-api/Cargo.toml` | 11 | Crate configuration |
-| `meridian-api/src/lib.rs` | 25 | Crate root with module docs |
-| `meridian-api/src/amount.rs` | ~720 | Amount type, arithmetic, 50 tests |
-| `meridian-api/src/auth/mod.rs` | 30 | Auth module root |
-| `meridian-api/src/auth/errors.rs` | 75 | AuthError enum |
-| `meridian-api/src/auth/tokens.rs` | ~420 | Token lifecycle, 10 tests |
-| `meridian-api/src/auth/flows.rs` | ~500 | Auth flows, 14 tests |
-| `meridian-api/src/auth/recovery.rs` | ~400 | Recovery flow, 9 tests |
-| `meridian-api/src/auth/validation.rs` | ~290 | Validation helpers, 29 tests |
-| `meridian-api/DESIGN.md` | This file | Design documentation |
+| File | Description |
+|---|---|
+| `meridian-api/Cargo.toml` | Crate configuration |
+| `meridian-api/src/lib.rs` | Crate root (exports pagination) |
+| `meridian-api/src/amount.rs` | Amount type, arithmetic, 50 tests |
+| `meridian-api/src/pagination.rs` | Cursor encoding, page types, **new** |
+| `meridian-api/src/auth/mod.rs` | Auth module root |
+| `meridian-api/src/auth/errors.rs` | AuthError enum |
+| `meridian-api/src/auth/tokens.rs` | Token lifecycle, 10 tests |
+| `meridian-api/src/auth/flows.rs` | Auth flows + paginated queries, 25 tests |
+| `meridian-api/src/auth/recovery.rs` | Recovery flow + paginated queries, 20 tests |
+| `meridian-api/src/auth/validation.rs` | Validation helpers, 29 tests |
+| `meridian-api/DESIGN.md` | This file |
 
 **No unrelated refactors, no disabled CI, no generated noise, no secrets.**

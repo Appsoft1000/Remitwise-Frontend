@@ -24,6 +24,7 @@ use std::collections::HashMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::amount::Amount;
+use crate::pagination::{self, Cursor, Page, PaginationError};
 
 use super::errors::AuthError;
 use super::tokens::{AccessToken, RefreshToken, TokenPair, TokenStore};
@@ -285,6 +286,120 @@ impl AuthService {
         self.store.refresh(refresh_token)
     }
 
+    // -- Paginated queries -------------------------------------------------
+
+    /// List sessions for a subject with cursor-based pagination.
+    ///
+    /// Results are ordered by `(created_at DESC, id DESC)` for
+    /// deterministic pagination.
+    pub fn list_sessions(
+        &self,
+        subject: &str,
+        cursor: Option<&Cursor>,
+        page_size: usize,
+    ) -> Result<Page<Session>, PaginationError> {
+        let mut sessions: Vec<&Session> = self
+            .sessions
+            .values()
+            .filter(|s| s.subject == subject)
+            .collect();
+
+        // Sort descending by (created_at, id).
+        sessions.sort_by_key(|a| std::cmp::Reverse((a.created_at, a.id)));
+
+        let total_count = sessions.len();
+        let page_size = pagination::normalize_page_size(page_size);
+
+        // Validate cursor scope.
+        if let Some(c) = cursor {
+            c.validate_scope(subject)?;
+        }
+
+        // Find start position after cursor.
+        let start = if let Some(c) = cursor {
+            sessions
+                .iter()
+                .position(|s| (s.created_at, s.id) < (c.timestamp, c.id))
+                .unwrap_or(sessions.len())
+        } else {
+            0
+        };
+
+        let end = std::cmp::min(start + page_size, sessions.len());
+        let page_items: Vec<Session> = sessions[start..end].iter().map(|s| (*s).clone()).collect();
+        let has_more = end < sessions.len();
+
+        let next_cursor = if has_more {
+            page_items
+                .last()
+                .map(|s| Cursor::new(subject.to_string(), s.created_at, s.id))
+        } else {
+            None
+        };
+
+        Ok(Page::new(
+            page_items,
+            page_size,
+            total_count,
+            next_cursor,
+            has_more,
+        ))
+    }
+
+    /// List active tokens for a subject with cursor-based pagination.
+    pub fn list_tokens(
+        &self,
+        subject: &str,
+        cursor: Option<&Cursor>,
+        page_size: usize,
+    ) -> Result<Page<TokenPair>, PaginationError> {
+        let mut pairs: Vec<&TokenPair> = self
+            .sessions
+            .values()
+            .filter(|s| s.subject == subject && !s.superseded)
+            .map(|s| &s.tokens)
+            .collect();
+
+        // Sort descending by (issued_at, access.id).
+        pairs.sort_by_key(|a| std::cmp::Reverse((a.access.issued_at, a.access.id)));
+
+        let total_count = pairs.len();
+        let page_size = pagination::normalize_page_size(page_size);
+
+        if let Some(c) = cursor {
+            c.validate_scope(subject)?;
+        }
+
+        let start = if let Some(c) = cursor {
+            pairs
+                .iter()
+                .position(|p| (p.access.issued_at, p.access.id) < (c.timestamp, c.id))
+                .unwrap_or(pairs.len())
+        } else {
+            0
+        };
+
+        let end = std::cmp::min(start + page_size, pairs.len());
+        let page_items: Vec<TokenPair> = pairs[start..end].iter().map(|p| (*p).clone()).collect();
+        let has_more = end < pairs.len();
+
+        let next_cursor = if has_more {
+            page_items
+                .last()
+                .map(|p| Cursor::new(subject.to_string(), p.access.issued_at, p.access.id))
+        } else {
+            None
+        };
+
+        Ok(Page::new(
+            page_items,
+            page_size,
+            total_count,
+            next_cursor,
+            has_more,
+        ))
+    }
+
     // -- Accessors --------------------------------------------------------
 
     pub fn store(&self) -> &TokenStore {
@@ -491,5 +606,122 @@ mod tests {
         // Replay old refresh token.
         let result = auth.refresh_session(&lr.tokens.refresh);
         assert_eq!(result, Err(AuthError::TokenAlreadyUsed));
+    }
+
+    // -- Pagination tests --------------------------------------------------
+
+    #[test]
+    fn list_sessions_empty() {
+        let auth = setup();
+        let page = auth.list_sessions("alice", None, 10).unwrap();
+        assert!(page.is_empty());
+        assert!(!page.has_more);
+        assert!(page.next_cursor.is_none());
+    }
+
+    #[test]
+    fn list_sessions_single_page() {
+        let mut auth = setup();
+        let _ = auth.login("alice".into(), "password", None).unwrap();
+        let _ = auth.login("alice".into(), "password", None).unwrap();
+
+        let page = auth.list_sessions("alice", None, 10).unwrap();
+        assert_eq!(page.len(), 2);
+        assert!(!page.has_more);
+        assert_eq!(page.total_count, 2);
+    }
+
+    #[test]
+    fn list_sessions_pagination() {
+        let mut auth = setup();
+        // Create 5 sessions for alice.
+        for _ in 0..5 {
+            let _ = auth.login("alice".into(), "password", None).unwrap();
+        }
+
+        let page1 = auth.list_sessions("alice", None, 2).unwrap();
+        assert_eq!(page1.len(), 2);
+        assert!(page1.has_more);
+        assert_eq!(page1.total_count, 5);
+
+        let cursor = page1.next_cursor.as_ref().unwrap();
+        let page2 = auth.list_sessions("alice", Some(cursor), 2).unwrap();
+        assert_eq!(page2.len(), 2);
+        assert!(page2.has_more);
+
+        let cursor2 = page2.next_cursor.as_ref().unwrap();
+        let page3 = auth.list_sessions("alice", Some(cursor2), 2).unwrap();
+        assert_eq!(page3.len(), 1);
+        assert!(!page3.has_more);
+    }
+
+    #[test]
+    fn list_sessions_scope_isolation() {
+        let mut auth = setup();
+        let _ = auth.login("alice".into(), "password", None).unwrap();
+        let _ = auth.login("bob".into(), "password", None).unwrap();
+
+        let alice_page = auth.list_sessions("alice", None, 10).unwrap();
+        assert_eq!(alice_page.len(), 1);
+        assert_eq!(alice_page.items[0].subject, "alice");
+
+        let bob_page = auth.list_sessions("bob", None, 10).unwrap();
+        assert_eq!(bob_page.len(), 1);
+        assert_eq!(bob_page.items[0].subject, "bob");
+    }
+
+    #[test]
+    fn list_sessions_cursor_scope_mismatch_fails() {
+        let mut auth = setup();
+        let _ = auth.login("alice".into(), "password", None).unwrap();
+
+        let cursor = crate::pagination::Cursor::new("bob".into(), 100, 1);
+        let result = auth.list_sessions("alice", Some(&cursor), 10);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn list_sessions_descending_order() {
+        let mut auth = setup();
+        let _lr1 = auth.login("alice".into(), "password", None).unwrap();
+        let _lr2 = auth.login("alice".into(), "password", None).unwrap();
+        let _lr3 = auth.login("alice".into(), "password", None).unwrap();
+
+        let page = auth.list_sessions("alice", None, 10).unwrap();
+        // Sessions should be in reverse creation order (newest first).
+        assert!(page.items[0].id >= page.items[1].id);
+        assert!(page.items[1].id >= page.items[2].id);
+    }
+
+    #[test]
+    fn list_tokens_empty() {
+        let auth = setup();
+        let page = auth.list_tokens("alice", None, 10).unwrap();
+        assert!(page.is_empty());
+    }
+
+    #[test]
+    fn list_tokens_active_only() {
+        let mut auth = setup();
+        let lr1 = auth.login("alice".into(), "password", None).unwrap();
+        let _ = auth.login("alice".into(), "password", None).unwrap();
+
+        // Logout one session.
+        auth.logout(lr1.session.id).unwrap();
+
+        let page = auth.list_tokens("alice", None, 10).unwrap();
+        assert_eq!(page.len(), 1); // only the active one
+    }
+
+    #[test]
+    fn list_sessions_all_other_subjects_excluded() {
+        let mut auth = setup();
+        let _ = auth.login("alice".into(), "password", None).unwrap();
+        let _ = auth.login("bob".into(), "password", None).unwrap();
+        let _ = auth.login("charlie".into(), "password", None).unwrap();
+
+        let page = auth.list_sessions("alice", None, 10).unwrap();
+        assert_eq!(page.len(), 1);
+        assert_eq!(page.total_count, 1);
     }
 }

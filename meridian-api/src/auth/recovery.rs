@@ -24,6 +24,8 @@
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::pagination::{self, Cursor, Page, PaginationError};
+
 use super::errors::AuthError;
 use super::tokens::{TokenPair, TokenStore};
 
@@ -256,6 +258,133 @@ impl RecoveryService {
         })
     }
 
+    // -- Paginated queries -------------------------------------------------
+
+    /// List recovery requests for a subject with cursor-based pagination.
+    ///
+    /// Results are ordered by `(created_at DESC, id DESC)` for
+    /// deterministic pagination.
+    pub fn list_requests(
+        &self,
+        subject: &str,
+        cursor: Option<&Cursor>,
+        page_size: usize,
+    ) -> Result<Page<RecoveryRequest>, PaginationError> {
+        let mut requests: Vec<&RecoveryRequest> = self
+            .requests
+            .values()
+            .filter(|r| r.subject == subject)
+            .collect(); // Sort descending by (created_at, id).
+        requests.sort_by_key(|a| std::cmp::Reverse((a.created_at, a.id)));
+
+        let total_count = requests.len();
+        let page_size = pagination::normalize_page_size(page_size);
+
+        if let Some(c) = cursor {
+            c.validate_scope(subject)?;
+        }
+
+        let start = if let Some(c) = cursor {
+            requests
+                .iter()
+                .position(|r| (r.created_at, r.id) < (c.timestamp, c.id))
+                .unwrap_or(requests.len())
+        } else {
+            0
+        };
+
+        let end = std::cmp::min(start + page_size, requests.len());
+        let page_items: Vec<RecoveryRequest> =
+            requests[start..end].iter().map(|r| (*r).clone()).collect();
+        let has_more = end < requests.len();
+
+        let next_cursor = if has_more {
+            page_items
+                .last()
+                .map(|r| Cursor::new(subject.to_string(), r.created_at, r.id))
+        } else {
+            None
+        };
+
+        Ok(Page::new(
+            page_items,
+            page_size,
+            total_count,
+            next_cursor,
+            has_more,
+        ))
+    }
+
+    /// List recovery requests for a subject filtered by status.
+    pub fn list_requests_by_status(
+        &self,
+        subject: &str,
+        status: RecoveryStatus,
+        cursor: Option<&Cursor>,
+        page_size: usize,
+    ) -> Result<Page<RecoveryRequest>, PaginationError> {
+        let mut requests: Vec<&RecoveryRequest> = self
+            .requests
+            .values()
+            .filter(|r| r.subject == subject && r.status == status)
+            .collect();
+
+        requests.sort_by_key(|a| std::cmp::Reverse((a.created_at, a.id)));
+
+        let total_count = requests.len();
+        let page_size = pagination::normalize_page_size(page_size);
+
+        if let Some(c) = cursor {
+            c.validate_scope(subject)?;
+        }
+
+        let start = if let Some(c) = cursor {
+            requests
+                .iter()
+                .position(|r| (r.created_at, r.id) < (c.timestamp, c.id))
+                .unwrap_or(requests.len())
+        } else {
+            0
+        };
+
+        let end = std::cmp::min(start + page_size, requests.len());
+        let page_items: Vec<RecoveryRequest> =
+            requests[start..end].iter().map(|r| (*r).clone()).collect();
+        let has_more = end < requests.len();
+
+        let next_cursor = if has_more {
+            page_items
+                .last()
+                .map(|r| Cursor::new(subject.to_string(), r.created_at, r.id))
+        } else {
+            None
+        };
+
+        Ok(Page::new(
+            page_items,
+            page_size,
+            total_count,
+            next_cursor,
+            has_more,
+        ))
+    }
+
+    /// Count recovery requests for a subject.
+    pub fn count_requests(&self, subject: &str) -> usize {
+        self.requests
+            .values()
+            .filter(|r| r.subject == subject)
+            .count()
+    }
+
+    /// Count recovery requests for a subject with a specific status.
+    pub fn count_requests_by_status(&self, subject: &str, status: RecoveryStatus) -> usize {
+        self.requests
+            .values()
+            .filter(|r| r.subject == subject && r.status == status)
+            .count()
+    }
+
     /// Cancel a recovery request.
     pub fn cancel_recovery(&mut self, session_id: u64) -> Result<(), AuthError> {
         let request = self
@@ -394,5 +523,132 @@ mod tests {
         assert_eq!(token.subject, "alice");
         // If someone adds a balance field, this test will fail — forcing
         // them to reconsider the security implication.
+    }
+
+    // -- Pagination tests --------------------------------------------------
+
+    #[test]
+    fn list_requests_empty() {
+        let svc = setup();
+        let page = svc.list_requests("alice", None, 10).unwrap();
+        assert!(page.is_empty());
+        assert!(!page.has_more);
+    }
+
+    #[test]
+    fn list_requests_single_page() {
+        let mut svc = setup();
+        let _ = svc.request_recovery("alice".into(), 1).unwrap();
+        let _ = svc.request_recovery("alice".into(), 2).unwrap();
+
+        let page = svc.list_requests("alice", None, 10).unwrap();
+        assert_eq!(page.len(), 2);
+        assert_eq!(page.total_count, 2);
+        assert!(!page.has_more);
+    }
+
+    #[test]
+    fn list_requests_pagination() {
+        let mut svc = setup();
+        // Create 5 recovery requests (different sessions).
+        for i in 1..=5 {
+            let _ = svc.request_recovery("alice".into(), i).unwrap();
+        }
+
+        let page1 = svc.list_requests("alice", None, 2).unwrap();
+        assert_eq!(page1.len(), 2);
+        assert!(page1.has_more);
+
+        let cursor = page1.next_cursor.as_ref().unwrap();
+        let page2 = svc.list_requests("alice", Some(cursor), 2).unwrap();
+        assert_eq!(page2.len(), 2);
+        assert!(page2.has_more);
+
+        let cursor2 = page2.next_cursor.as_ref().unwrap();
+        let page3 = svc.list_requests("alice", Some(cursor2), 2).unwrap();
+        assert_eq!(page3.len(), 1);
+        assert!(!page3.has_more);
+    }
+
+    #[test]
+    fn list_requests_scope_isolation() {
+        let mut svc = setup();
+        let _ = svc.request_recovery("alice".into(), 1).unwrap();
+        let _ = svc.request_recovery("bob".into(), 2).unwrap();
+
+        let alice_page = svc.list_requests("alice", None, 10).unwrap();
+        assert_eq!(alice_page.len(), 1);
+        assert_eq!(alice_page.items[0].subject, "alice");
+
+        let bob_page = svc.list_requests("bob", None, 10).unwrap();
+        assert_eq!(bob_page.len(), 1);
+        assert_eq!(bob_page.items[0].subject, "bob");
+    }
+
+    #[test]
+    fn list_requests_cursor_scope_mismatch_fails() {
+        let mut svc = setup();
+        let _ = svc.request_recovery("alice".into(), 1).unwrap();
+
+        let cursor = crate::pagination::Cursor::new("bob".into(), 100, 1);
+        let result = svc.list_requests("alice", Some(&cursor), 10);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn list_requests_by_status() {
+        let mut svc = setup();
+        let _ = svc.request_recovery("alice".into(), 1).unwrap();
+        let _ = svc.request_recovery("alice".into(), 2).unwrap();
+        let token = svc.request_recovery("alice".into(), 3).unwrap().clone();
+        let mut store = TokenStore::new();
+        let _ = store.issue_pair("alice".into());
+        let _ = svc.complete_recovery(&token, &mut store).unwrap();
+
+        let pending = svc
+            .list_requests_by_status("alice", RecoveryStatus::Pending, None, 10)
+            .unwrap();
+        assert_eq!(pending.len(), 2);
+
+        let completed = svc
+            .list_requests_by_status("alice", RecoveryStatus::Completed, None, 10)
+            .unwrap();
+        assert_eq!(completed.len(), 1);
+    }
+
+    #[test]
+    fn count_requests() {
+        let mut svc = setup();
+        let _ = svc.request_recovery("alice".into(), 1).unwrap();
+        let _ = svc.request_recovery("alice".into(), 2).unwrap();
+        let _ = svc.request_recovery("bob".into(), 3).unwrap();
+
+        assert_eq!(svc.count_requests("alice"), 2);
+        assert_eq!(svc.count_requests("bob"), 1);
+        assert_eq!(svc.count_requests("charlie"), 0);
+    }
+
+    #[test]
+    fn list_requests_descending_order() {
+        let mut svc = setup();
+        let _ = svc.request_recovery("alice".into(), 1).unwrap();
+        let _ = svc.request_recovery("alice".into(), 2).unwrap();
+        let _ = svc.request_recovery("alice".into(), 3).unwrap();
+
+        let page = svc.list_requests("alice", None, 10).unwrap();
+        assert!(page.items[0].id >= page.items[1].id);
+        assert!(page.items[1].id >= page.items[2].id);
+    }
+
+    #[test]
+    fn list_requests_all_other_subjects_excluded() {
+        let mut svc = setup();
+        let _ = svc.request_recovery("alice".into(), 1).unwrap();
+        let _ = svc.request_recovery("bob".into(), 2).unwrap();
+        let _ = svc.request_recovery("charlie".into(), 3).unwrap();
+
+        let page = svc.list_requests("alice", None, 10).unwrap();
+        assert_eq!(page.len(), 1);
+        assert_eq!(page.total_count, 1);
     }
 }
