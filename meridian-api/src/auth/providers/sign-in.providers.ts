@@ -11,6 +11,8 @@ import { JwtService } from '@nestjs/jwt';
 import jwtConfig from '../config/jwt.config';
 import { ConfigType } from '@nestjs/config';
 import { GenerateTokenProvider } from './token.provider';
+import { AuditService } from '../../audit/audit.service';
+import { AuditAction } from '../../audit/audit-log.entity';
 
 @Injectable()
 export class SignInProviders {
@@ -22,6 +24,8 @@ export class SignInProviders {
 
     // injecting generatetokenprovider
     private readonly generateTokenProvider: GenerateTokenProvider,
+
+    private readonly auditService: AuditService,
   ) {}
 
   public async SignIn(signInDto: SignInDto) {
@@ -57,6 +61,15 @@ export class SignInProviders {
     }
 
     const token = await this.generateTokenProvider.generateTokens(user);
+
+    await this.auditService.log({
+      entityName: 'User',
+      entityId: user.id,
+      action: AuditAction.SIGN_IN,
+      performedById: user.id,
+      performedByEmail: user.email,
+    });
+
     return [token, user];
   }
 }

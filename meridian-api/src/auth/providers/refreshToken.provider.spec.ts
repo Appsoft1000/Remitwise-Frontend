@@ -17,6 +17,7 @@ jest.mock('../config/jwt.config', () => ({ default: { KEY: 'jwt' } }), {
   virtual: true,
 });
 jest.mock('../dto/refresh-token-dto', () => ({}), { virtual: true });
+jest.mock('../../audit/audit.service', () => ({ AuditService: class AuditService {} }));
 
 import { UnauthorizedException } from '@nestjs/common';
 import { RefreshTokenProvider } from './refreshToken.provider';
@@ -40,6 +41,7 @@ describe('RefreshTokenProvider', () => {
     encrypt: jest.Mock;
     decrypt: jest.Mock;
   };
+  let auditService: { log: jest.Mock };
 
   const jwtConfig = {
     secret: 'secret',
@@ -92,6 +94,7 @@ describe('RefreshTokenProvider', () => {
       })),
       decrypt: jest.fn(async () => 'valid'),
     };
+    auditService = { log: jest.fn(async () => undefined) };
 
     provider = new RefreshTokenProvider(
       userService as any,
@@ -101,6 +104,7 @@ describe('RefreshTokenProvider', () => {
       hashingProvider as any,
       generateTokenProvider as any,
       cryptoProvider as any,
+      auditService as any,
     );
   });
 
@@ -120,6 +124,9 @@ describe('RefreshTokenProvider', () => {
         { revokedAt: expect.any(Date) },
       );
       expect(refreshTokenRepository.save).toHaveBeenCalled();
+      expect(auditService.log).toHaveBeenCalledWith(
+        expect.objectContaining({ action: 'REFRESH', entityId: 'new-id' }),
+      );
       expect(result).toEqual({
         access_token: 'new-access',
         refresh_token: 'new-refresh',
@@ -136,6 +143,7 @@ describe('RefreshTokenProvider', () => {
       await expect(
         provider.refreshToken({ refreshToken: 'valid' } as any),
       ).rejects.toBeInstanceOf(UnauthorizedException);
+      expect(auditService.log).not.toHaveBeenCalled();
     });
 
     it('throws UnauthorizedException when the stored token is expired', async () => {
@@ -225,6 +233,9 @@ describe('RefreshTokenProvider', () => {
         { jti: storedToken.jti, userId: user.id },
         { revokedAt: expect.any(Date) },
       );
+      expect(auditService.log).toHaveBeenCalledWith(
+        expect.objectContaining({ action: 'LOGOUT', entityId: storedToken.jti }),
+      );
       expect(result).toEqual({ message: 'Logged out successfully' });
     });
 
@@ -242,6 +253,9 @@ describe('RefreshTokenProvider', () => {
       expect(refreshTokenRepository.update).toHaveBeenCalledWith(
         { userId: user.id, revokedAt: null },
         { revokedAt: expect.any(Date) },
+      );
+      expect(auditService.log).toHaveBeenCalledWith(
+        expect.objectContaining({ action: 'LOGOUT_ALL', performedById: user.id }),
       );
       expect(result).toEqual({ message: 'All sessions revoked successfully' });
     });

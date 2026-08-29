@@ -5,6 +5,7 @@ jest.mock('src/users/user.entity', () => ({ User: class User {} }), {
 import { UnauthorizedException } from '@nestjs/common';
 import { VerifyEmailProvider } from './verify-email.provider';
 import { VerificationTokenProvider } from './verification-token.provider';
+jest.mock('../../audit/audit.service', () => ({ AuditService: class AuditService {} }));
 
 describe('VerifyEmailProvider (issue #435)', () => {
   let provider: VerifyEmailProvider;
@@ -25,6 +26,7 @@ describe('VerifyEmailProvider (issue #435)', () => {
     encrypt: jest.Mock;
     decrypt: jest.Mock;
   };
+  let auditService: { log: jest.Mock };
 
   const sampleUser: any = {
     id: 1,
@@ -56,12 +58,14 @@ describe('VerifyEmailProvider (issue #435)', () => {
       })),
       decrypt: jest.fn(async () => JSON.stringify({ verificationToken: 'raw-token' })),
     };
+    auditService = { log: jest.fn(async () => undefined) };
 
     provider = new VerifyEmailProvider(
       usersRepository as any,
       tokenProvider as any,
       mailService as any,
       cryptoProvider as any,
+      auditService as any,
     );
   });
 
@@ -85,6 +89,9 @@ describe('VerifyEmailProvider (issue #435)', () => {
         sampleUser,
         'raw-token',
         expect.any(Date),
+      );
+      expect(auditService.log).toHaveBeenCalledWith(
+        expect.objectContaining({ action: 'ISSUE_VERIFICATION_TOKEN', entityId: sampleUser.id }),
       );
     });
 
@@ -140,6 +147,9 @@ describe('VerifyEmailProvider (issue #435)', () => {
         emailVerificationExpires: null,
         encryptedData: null,
       });
+      expect(auditService.log).toHaveBeenCalledWith(
+        expect.objectContaining({ action: 'VERIFY_EMAIL', entityId: sampleUser.id }),
+      );
     });
 
     it('matches via the decrypted envelope when the hash path misses (issue #631)', async () => {
@@ -164,6 +174,9 @@ describe('VerifyEmailProvider (issue #435)', () => {
         emailVerificationExpires: null,
         encryptedData: null,
       });
+      expect(auditService.log).toHaveBeenCalledWith(
+        expect.objectContaining({ action: 'VERIFY_EMAIL', entityId: sampleUser.id }),
+      );
     });
 
     it('treats a token as invalid when decryption fails', async () => {
@@ -180,6 +193,7 @@ describe('VerifyEmailProvider (issue #435)', () => {
         UnauthorizedException,
       );
       expect(usersRepository.update).not.toHaveBeenCalled();
+      expect(auditService.log).not.toHaveBeenCalled();
     });
 
     it('throws UnauthorizedException when no candidate user matches', async () => {
@@ -189,6 +203,7 @@ describe('VerifyEmailProvider (issue #435)', () => {
         UnauthorizedException,
       );
       expect(usersRepository.update).not.toHaveBeenCalled();
+      expect(auditService.log).not.toHaveBeenCalled();
     });
 
     it('throws UnauthorizedException for empty input', async () => {

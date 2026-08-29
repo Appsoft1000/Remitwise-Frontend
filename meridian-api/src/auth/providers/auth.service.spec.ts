@@ -4,6 +4,7 @@ jest.mock('src/users/user.entity', () => ({ User: class User {} }), {
 
 import { ConflictException, UnauthorizedException } from '@nestjs/common';
 import { AuthService } from './auth.service';
+jest.mock('../../audit/audit.service', () => ({ AuditService: class AuditService {} }));
 
 describe('AuthService - email verification (issue #435)', () => {
   let service: AuthService;
@@ -13,8 +14,9 @@ describe('AuthService - email verification (issue #435)', () => {
     logout: jest.Mock;
     logoutAll: jest.Mock;
   };
-  let verifyEmailProvider: { verifyEmail: jest.Mock };
+  let verifyEmailProvider: { verifyEmail: jest.Mock; issueVerificationToken: jest.Mock };
   let usersRepository: { findOne: jest.Mock };
+  let auditService: { log: jest.Mock };
 
   const fakeUser: any = { id: 7, email: 'a@b.com' };
 
@@ -25,14 +27,16 @@ describe('AuthService - email verification (issue #435)', () => {
       logout: jest.fn(),
       logoutAll: jest.fn(),
     };
-    verifyEmailProvider = { verifyEmail: jest.fn() };
+    verifyEmailProvider = { verifyEmail: jest.fn(), issueVerificationToken: jest.fn() };
     usersRepository = { findOne: jest.fn() };
+    auditService = { log: jest.fn(async () => undefined) };
 
     service = new AuthService(
       signInProviders as any,
       refreshTokenProvider as any,
       verifyEmailProvider as any,
       usersRepository as any,
+      auditService as any,
     );
   });
 
@@ -65,6 +69,10 @@ describe('AuthService - email verification (issue #435)', () => {
         where: { email: fakeUser.email },
         withDeleted: false,
       });
+      expect(verifyEmailProvider.issueVerificationToken).toHaveBeenCalledWith(fakeUser);
+      expect(auditService.log).toHaveBeenCalledWith(
+        expect.objectContaining({ action: 'RESEND_VERIFICATION', entityId: fakeUser.id }),
+      );
       expect(result).toMatchObject({ status: 'ok' });
     });
 

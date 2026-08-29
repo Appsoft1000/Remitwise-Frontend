@@ -118,6 +118,7 @@ wtConfig),
     JwtModule.registerAsync(jwtConfig.asProvider()),
     TypeORMModule.forFeature([RefreshToken, User, AuthIdempotencyKey]),
     CryptoModule,
+    AuditModule,
   ],
   providers: [
     AuthService,

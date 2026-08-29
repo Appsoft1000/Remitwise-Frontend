@@ -16,6 +16,8 @@ import { GenerateTokenProvider } from './token.provider';
 import { RefreshToken } from '../entities/refresh-token.entity';
 import { HashingProvider } from './hashing';
 import { CryptoProvider, constantTimeEqual } from 'src/crypto/providers/crypto.provider';
+import { AuditService } from '../../audit/audit.service';
+import { AuditAction } from '../../audit/audit-log.entity';
 
 @Injectable()
 export class RefreshTokenProvider {
@@ -43,6 +45,8 @@ export class RefreshTokenProvider {
     // of each refresh token (under the user's DEK) so sessions can be
     // audited/rotated without re-hashing.
     private readonly cryptoProvider: CryptoProvider,
+
+    private readonly auditService: AuditService,
   ) {}
 
   public async refreshToken(
@@ -109,6 +113,14 @@ export class RefreshTokenProvider {
         ...(await this.encryptRefreshToken(tokens.refresh_token, user)),
       });
 
+      await this.auditService.log({
+        entityName: 'Session',
+        entityId: newRefreshToken.id,
+        action: AuditAction.REFRESH,
+        performedById: user.id,
+        performedByEmail: user.email,
+      });
+
       return {
         access_token: tokens.access_token,
         refresh_token: tokens.refresh_token,
@@ -146,6 +158,14 @@ export class RefreshTokenProvider {
         { revokedAt: new Date() },
       );
 
+      await this.auditService.log({
+        entityName: 'Session',
+        entityId: jti,
+        action: AuditAction.LOGOUT,
+        performedById: user.id,
+        performedByEmail: user.email,
+      });
+
       return { message: 'Logged out successfully' };
     } catch (error) {
       throw new UnauthorizedException(
@@ -159,6 +179,21 @@ export class RefreshTokenProvider {
       { userId, revokedAt: null },
       { revokedAt: new Date() },
     );
+
+    let email = null;
+    try {
+      const user = await this.userService.findOneId(userId);
+      email = user?.email;
+    } catch (e) {
+      // ignore
+    }
+
+    await this.auditService.log({
+      entityName: 'Session',
+      action: AuditAction.LOGOUT_ALL,
+      performedById: userId,
+      performedByEmail: email,
+    });
 
     return { message: 'All sessions revoked successfully' };
   }

@@ -7,6 +7,8 @@ import { MailProvider } from 'src/mail/providers/mail.provider';
 import { VERIFICATION_TTL_MS } from './verification-token.constants';
 import { CryptoProvider, constantTimeEqual } from 'src/crypto/providers/crypto.provider';
 import { Role } from '../enums/role.enum';
+import { AuditService } from '../../audit/audit.service';
+import { AuditAction } from '../../audit/audit-log.entity';
 
 /**
  * Email-verification flows (issue #435).
@@ -35,6 +37,8 @@ export class VerifyEmailProvider {
     // Envelope encryption (issue #631): encrypts the raw token on the user
     // row so it can be rotated/audited without re-hashing.
     private readonly cryptoProvider: CryptoProvider,
+
+    private readonly auditService: AuditService,
   ) {}
 
   /**
@@ -61,6 +65,14 @@ export class VerifyEmailProvider {
       emailVerified: false,
       dataEncryptionKeyId: encrypted?.dataEncryptionKeyId ?? user.dataEncryptionKeyId ?? null,
       encryptedData: encrypted?.encryptedData ?? null,
+    });
+
+    await this.auditService.log({
+      entityName: 'VerificationToken',
+      entityId: user.id,
+      action: AuditAction.ISSUE_VERIFICATION_TOKEN,
+      performedById: user.id,
+      performedByEmail: user.email,
     });
 
     try {
@@ -139,6 +151,14 @@ export class VerifyEmailProvider {
         emailVerificationToken: null,
         emailVerificationExpires: null,
         encryptedData: null,
+      });
+
+      await this.auditService.log({
+        entityName: 'User',
+        entityId: user.id,
+        action: AuditAction.VERIFY_EMAIL,
+        performedById: user.id,
+        performedByEmail: user.email,
       });
 
       return { ...user, emailVerified: true, role: nextRole };

@@ -16,6 +16,7 @@ jest.mock('./token.provider', () => ({
 jest.mock('../config/jwt.config', () => ({ default: { KEY: 'jwt' } }), {
   virtual: true,
 });
+jest.mock('../../audit/audit.service', () => ({ AuditService: class AuditService {} }));
 
 import {
   ForbiddenException,
@@ -29,6 +30,7 @@ describe('SignInProviders', () => {
   let userAuthFacade: { findUserByEmail: jest.Mock };
   let hashingProvider: { comparePassword: jest.Mock };
   let generateTokenProvider: { generateTokens: jest.Mock };
+  let auditService: { log: jest.Mock };
 
   // Default mock user is verified so the pre-existing password-paths below
   // continue to pass after the 403 verification gate was added
@@ -54,11 +56,13 @@ describe('SignInProviders', () => {
         jti: 'j',
       })),
     };
+    auditService = { log: jest.fn(async () => undefined) };
 
     provider = new SignInProviders(
       userAuthFacade as any,
       hashingProvider as any,
       generateTokenProvider as any,
+      auditService as any,
     );
   });
 
@@ -74,6 +78,9 @@ describe('SignInProviders', () => {
       user.password,
     );
     expect(generateTokenProvider.generateTokens).toHaveBeenCalledWith(user);
+    expect(auditService.log).toHaveBeenCalledWith(
+      expect.objectContaining({ action: 'SIGN_IN', entityId: user.id }),
+    );
     expect(tokens).toEqual([
       { access_token: 'a', refresh_token: 'r', jti: 'j' },
       user,
@@ -87,6 +94,7 @@ describe('SignInProviders', () => {
       provider.SignIn({ email: 'a@b.com', password: 'wrong' } as any),
     ).rejects.toBeInstanceOf(UnauthorizedException);
     expect(generateTokenProvider.generateTokens).not.toHaveBeenCalled();
+    expect(auditService.log).not.toHaveBeenCalled();
   });
 
   it('wraps hashing errors in a RequestTimeoutException', async () => {
@@ -112,5 +120,6 @@ describe('SignInProviders', () => {
       provider.SignIn({ email: 'a@b.com', password: 'plain' } as any),
     ).rejects.toBeInstanceOf(ForbiddenException);
     expect(generateTokenProvider.generateTokens).not.toHaveBeenCalled();
+    expect(auditService.log).not.toHaveBeenCalled();
   });
 });
