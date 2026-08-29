@@ -41,6 +41,19 @@ import {
   createEvent,
   deriveBindingKey,
   type EmergencyTransferEvent,
+  type ReviewStartedEvent,
+  type RiskAcknowledgedEvent,
+  type RiskUnacknowledgedEvent,
+  type ConfirmationBoundEvent,
+  type SubmitAttemptedEvent,
+  type SubmitSucceededEvent,
+  type SubmitFailedEvent,
+  type DuplicateBlockedEvent,
+  type ConflictingKeyReusedEvent,
+  type ExpiredEvent,
+  type ConfigChangedEvent,
+  type UnauthorizedEvent,
+  type DismissedEvent,
 } from '@/models/emergency-transfer-event'
 
 import {
@@ -92,6 +105,7 @@ type Action =
   | { type: 'SUBMIT_SUCCESS'; txHash: string }
   | { type: 'SUBMIT_FAILURE'; errorCode: string; errorMessage: string }
   | { type: 'DUPLICATE_BLOCKED' }
+  | { type: 'CONFLICTING_KEY_REUSED'; reason: string }
   | { type: 'EXPIRE' }
   | { type: 'CONFIG_CHANGED'; newConfig: EmergencyTransferConfig }
   | { type: 'UNAUTHORIZED'; reason: string }
@@ -123,7 +137,7 @@ function reducer(
 ): EmergencyTransferState {
   switch (action.type) {
     case 'START_REVIEW': {
-      const event = createEvent<EmergencyTransferEvent>({
+      const event = createEvent<ReviewStartedEvent>({
         eventType: 'REVIEW_STARTED',
         configSnapshot: action.config,
       })
@@ -140,7 +154,7 @@ function reducer(
 
     case 'ACKNOWLEDGE_RISK': {
       if (state.phase !== 'reviewing') return state
-      const event = createEvent<EmergencyTransferEvent>({
+      const event = createEvent<RiskAcknowledgedEvent>({
         eventType: 'RISK_ACKNOWLEDGED',
         configSnapshot: state.reviewedConfig!,
         acknowledgedText: RISK_ACKNOWLEDGEMENT_TEXT,
@@ -153,7 +167,7 @@ function reducer(
 
     case 'UNACKNOWLEDGE_RISK': {
       if (state.phase !== 'reviewing') return state
-      const event = createEvent<EmergencyTransferEvent>({
+      const event = createEvent<RiskUnacknowledgedEvent>({
         eventType: 'RISK_UNACKNOWLEDGED',
         configSnapshot: state.reviewedConfig!,
       })
@@ -165,7 +179,7 @@ function reducer(
 
     case 'BIND_CONFIRMATION': {
       if (state.phase !== 'reviewing' || !state.riskAcknowledged) return state
-      const event = createEvent<EmergencyTransferEvent>({
+      const event = createEvent<ConfirmationBoundEvent>({
         eventType: 'CONFIRMATION_BOUND',
         configSnapshot: state.reviewedConfig!,
         bindingKey: action.bindingKey,
@@ -178,7 +192,7 @@ function reducer(
 
     case 'SUBMIT': {
       if (state.phase !== 'confirmed') return state
-      const event = createEvent<EmergencyTransferEvent>({
+      const event = createEvent<SubmitAttemptedEvent>({
         eventType: 'SUBMIT_ATTEMPTED',
         configSnapshot: state.reviewedConfig!,
         bindingKey: state.bindingKey!,
@@ -187,8 +201,8 @@ function reducer(
     }
 
     case 'SUBMIT_SUCCESS': {
-      if (state.phase !== 'submitting') return state
-      const event = createEvent<EmergencyTransferEvent>({
+      if (state.phase !== 'submitting' && state.phase !== 'confirmed') return state
+      const event = createEvent<SubmitSucceededEvent>({
         eventType: 'SUBMIT_SUCCEEDED',
         configSnapshot: state.reviewedConfig!,
         txHash: action.txHash,
@@ -202,7 +216,7 @@ function reducer(
 
     case 'SUBMIT_FAILURE': {
       if (state.phase !== 'submitting') return state
-      const event = createEvent<EmergencyTransferEvent>({
+      const event = createEvent<SubmitFailedEvent>({
         eventType: 'SUBMIT_FAILED',
         configSnapshot: state.reviewedConfig!,
         errorCode: action.errorCode,
@@ -216,7 +230,7 @@ function reducer(
     }
 
     case 'DUPLICATE_BLOCKED': {
-      const event = createEvent<EmergencyTransferEvent>({
+      const event = createEvent<DuplicateBlockedEvent>({
         eventType: 'DUPLICATE_BLOCKED',
         configSnapshot: state.reviewedConfig!,
         bindingKey: state.bindingKey!,
@@ -224,16 +238,27 @@ function reducer(
       return appendEvent(state, event)
     }
 
-    case 'EXPIRE': {
-      if (
-        state.phase !== 'reviewing' &&
-        state.phase !== 'confirmed' &&
-        state.phase !== 'submitting'
+    case 'CONFLICTING_KEY_REUSED': {
+      const event = createEvent<ConflictingKeyReusedEvent>({
+        eventType: 'CONFLICTING_KEY_REUSED',
+        configSnapshot: state.reviewedConfig ?? ({} as EmergencyTransferConfig),
+        bindingKey: state.bindingKey ?? '',
+        reason: action.reason,
+      })
+      return appendEvent(
+        {
+          ...state,
+          phase: 'failed',
+          errorMessage: action.reason,
+        },
+        event,
       )
-        return state
-      const event = createEvent<EmergencyTransferEvent>({
+    }
+
+    case 'EXPIRE': {
+      const event = createEvent<ExpiredEvent>({
         eventType: 'EXPIRED',
-        configSnapshot: state.reviewedConfig!,
+        configSnapshot: state.reviewedConfig ?? ({} as EmergencyTransferConfig),
       })
       return appendEvent(
         {
@@ -246,9 +271,10 @@ function reducer(
       )
     }
 
+
     case 'CONFIG_CHANGED': {
       if (state.reviewedConfig === null) return state
-      const event = createEvent<EmergencyTransferEvent>({
+      const event = createEvent<ConfigChangedEvent>({
         eventType: 'CONFIG_CHANGED',
         configSnapshot: state.reviewedConfig,
         newConfig: action.newConfig,
@@ -265,7 +291,7 @@ function reducer(
     }
 
     case 'UNAUTHORIZED': {
-      const event = createEvent<EmergencyTransferEvent>({
+      const event = createEvent<UnauthorizedEvent>({
         eventType: 'UNAUTHORIZED',
         configSnapshot: state.reviewedConfig ?? ({} as EmergencyTransferConfig),
         reason: action.reason,
@@ -282,7 +308,7 @@ function reducer(
 
     case 'DISMISS': {
       if (state.reviewedConfig) {
-        const event = createEvent<EmergencyTransferEvent>({
+        const event = createEvent<DismissedEvent>({
           eventType: 'DISMISSED',
           configSnapshot: state.reviewedConfig,
         })
@@ -290,6 +316,7 @@ function reducer(
       }
       return initialState
     }
+
 
     case 'RESET':
       return { ...initialState }
@@ -387,8 +414,10 @@ export function useEmergencyTransfer({
   /** Guards against concurrent submits. */
   const submittingRef = useRef(false)
 
-  /** Tracks whether a submit has already succeeded for this binding key. */
-  const succeededKeysRef = useRef<Set<string>>(new Set())
+  /** Stores completed operations for safe retries and idempotency enforcement. */
+  const completedOperationsRef = useRef<
+    Map<string, { payload: ConfirmationPayload; result: { txHash: string } }>
+  >(new Map())
 
   // -------------------------------------------------------------------------
   // Derived: msUntilExpiry — recomputed each render, no extra state needed
@@ -451,6 +480,11 @@ export function useEmergencyTransfer({
     config?.asset?.contractAddress,
     config?.networkId,
     config?.expiresAt,
+    config?.memo,
+    config?.quoteId,
+    config?.quoteHash,
+    config?.requestKey,
+    config?.nonce,
     state.phase,
   ])
 
@@ -505,7 +539,9 @@ export function useEmergencyTransfer({
   }, [])
 
   const bindConfirmation = useCallback((): ConfirmationPayload | null => {
-    if (!state.reviewedConfig || !state.riskAcknowledged) return null
+    if (state.phase !== 'reviewing' || !state.reviewedConfig || !state.riskAcknowledged)
+      return null
+
 
     if (isConfigExpired(state.reviewedConfig, getNow())) {
       dispatch({ type: 'EXPIRE' })
@@ -526,6 +562,10 @@ export function useEmergencyTransfer({
       networkId: state.reviewedConfig.networkId,
       authorizedBy: state.reviewedConfig.authorizedBy,
       memo: state.reviewedConfig.memo,
+      quoteId: state.reviewedConfig.quoteId,
+      quoteHash: state.reviewedConfig.quoteHash,
+      requestKey: state.reviewedConfig.requestKey,
+      nonce: state.reviewedConfig.nonce,
       riskAcknowledged: true as const,
       acknowledgedText: RISK_ACKNOWLEDGEMENT_TEXT,
     }
@@ -545,7 +585,9 @@ export function useEmergencyTransfer({
     payloadRef.current = frozen
     dispatch({ type: 'BIND_CONFIRMATION', bindingKey })
     return frozen
-  }, [state.reviewedConfig, state.riskAcknowledged, getNow])
+  }, [state.phase, state.reviewedConfig, state.riskAcknowledged, getNow])
+
+
 
   const submit = useCallback(async (): Promise<void> => {
     // ---- Duplicate-submit guard ----
@@ -555,7 +597,8 @@ export function useEmergencyTransfer({
     }
 
     const payload = payloadRef.current
-    if (!payload || state.phase !== 'confirmed') return
+    if (!payload || (state.phase !== 'confirmed' && state.phase !== 'succeeded')) return
+
 
     // ---- Re-check expiry ----
     if (getNow() >= payload.expiresAt) {
@@ -589,10 +632,40 @@ export function useEmergencyTransfer({
       return
     }
 
-    // ---- Duplicate binding-key guard ----
-    if (succeededKeysRef.current.has(payload.bindingKey)) {
-      dispatch({ type: 'DUPLICATE_BLOCKED' })
-      return
+    // ---- Idempotency & Safe Retry vs Conflicting Key Guard ----
+    const keysToCheck = [
+      payload.bindingKey,
+      payload.requestKey,
+      payload.nonce,
+    ].filter(Boolean) as string[]
+
+    for (const key of keysToCheck) {
+      const record = completedOperationsRef.current.get(key)
+      if (record) {
+        const matches =
+          record.payload.configId === payload.configId &&
+          record.payload.recipient === payload.recipient &&
+          record.payload.amountRaw === payload.amountRaw &&
+          record.payload.asset.symbol === payload.asset.symbol &&
+          record.payload.asset.contractAddress === payload.asset.contractAddress &&
+          record.payload.networkId === payload.networkId &&
+          record.payload.quoteId === payload.quoteId &&
+          record.payload.quoteHash === payload.quoteHash &&
+          record.payload.nonce === payload.nonce
+
+        if (matches) {
+          // Safe retry: return deterministic result without re-executing provider
+          dispatch({ type: 'SUBMIT_SUCCESS', txHash: record.result.txHash })
+          return
+        } else {
+          // Conflicting key reuse: reject attempt and leave zero partial state
+          dispatch({
+            type: 'CONFLICTING_KEY_REUSED',
+            reason: `Request key "${key}" was already used with conflicting transfer parameters.`,
+          })
+          return
+        }
+      }
     }
 
     submittingRef.current = true
@@ -600,7 +673,11 @@ export function useEmergencyTransfer({
 
     try {
       const { txHash } = await provider(payload)
-      succeededKeysRef.current.add(payload.bindingKey)
+      const resultObj = { txHash }
+      const entry = { payload, result: resultObj }
+      for (const key of keysToCheck) {
+        completedOperationsRef.current.set(key, entry)
+      }
       dispatch({ type: 'SUBMIT_SUCCESS', txHash })
     } catch (err: unknown) {
       const msg =
@@ -614,6 +691,7 @@ export function useEmergencyTransfer({
       submittingRef.current = false
     }
   }, [config, state.phase, state.reviewedConfig, provider, getNow])
+
 
   const dismiss = useCallback(() => {
     payloadRef.current = null
